@@ -652,14 +652,25 @@ function apiFetch(path, opts) {
 
 function load() {
   setDot('busy','Laster...');
-  apiFetch('/listings').then(function(d){ ST.listings = d||[]; render(); document.getElementById('scanLbl').textContent = 'Oppdatert '+new Date().toLocaleTimeString('nb-NO'); setDot('live','Tilkoblet'); }).catch(function(e){ flash('Feil: '+e.message,'err'); setDot('live','Tilkoblet'); });
+  apiFetch('/listings').then(function(d){
+    ST.listings = Array.isArray(d) ? d : (d && d.listings ? d.listings : []);
+    render();
+    document.getElementById('scanLbl').textContent = 'Oppdatert '+new Date().toLocaleTimeString('nb-NO');
+    setDot('live','Tilkoblet');
+  }).catch(function(e){ flash('Feil: '+e.message,'err'); setDot('live','Tilkoblet'); });
 }
 
 function scan() {
   var btn = document.getElementById('scanbtn');
   btn.disabled = true; btn.textContent = 'Scanner…';
   setDot('busy','Scanner');
-  apiFetch('/scan').then(function(r){ flash('Ferdig: '+r.scanned+' nye, '+r.analyzed+' analysert','ok'); return apiFetch('/listings'); }).then(function(d){ ST.listings=d||[]; render(); }).catch(function(e){ flash('Feil: '+e.message,'err'); }).finally(function(){ btn.disabled=false; btn.textContent='Skann nå'; setDot('live','Tilkoblet'); });
+  apiFetch('/scan').then(function(r){
+    flash('Ferdig: '+(r.scannedNew||0)+' nye, '+(r.analyzedNow||0)+' analysert','ok');
+    return apiFetch('/listings');
+  }).then(function(d){
+    ST.listings = Array.isArray(d) ? d : (d && d.listings ? d.listings : []);
+    render();
+  }).catch(function(e){ flash('Feil: '+e.message,'err'); }).finally(function(){ btn.disabled=false; btn.textContent='Skann nå'; setDot('live','Tilkoblet'); });
 }
 
 function loadS() {
