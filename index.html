@@ -856,6 +856,7 @@ function copySEO() {
   navigator.clipboard.writeText(text).then(function() { flash('Kopiert til utklippstavle','ok'); });
 }
 
+function loadDemo(){
   ST.listings=[
     {id:'d1',title:'Hans J. Wegner Y-stol i teak — original',link:'#',price:800,imageUrl:null,pubDate:new Date().toISOString(),analysis:{score:9,reason:'Klassisk Wegner Y-stol (CH24) til ekstremt lav pris — selger kjenner trolig ikke verdien.',estimatedResalePrice:4500,verifiedResalePrice:4800,potentialProfit:4000,category:'Stol',designerMatch:'Hans J. Wegner',riskLevel:'low',action:'buy',confidence:91,confidenceReason:'5 tilsvarende Y-stoler solgt på Lauritz siste 3 mnd, snittpris 4 800 kr',marketEvidence:'Lauritz: 4–6k kr · eBay: $450–700',deepSearched:true}},
     {id:'d2',title:'Arne Jacobsen Series 7 stol, sort',link:'#',price:400,imageUrl:null,pubDate:new Date().toISOString(),analysis:{score:8,reason:'Ikonisk Series 7 til svært lav pris. Originale selges for 1 500–3 000 kr.',estimatedResalePrice:2200,verifiedResalePrice:2100,potentialProfit:1700,category:'Stol',designerMatch:'Arne Jacobsen',riskLevel:'low',action:'buy',confidence:84,confidenceReason:'Mange Series 7 på markedet — bekreft original vs. repro.',marketEvidence:'Finn aktive: 1,5–3k · eBay: $80–200',deepSearched:true}},
