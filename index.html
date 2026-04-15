@@ -3,10 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Finn Hunter</title>
+<title>Finn Hunter v4.1</title>
 <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;1,300;1,400&family=Jost:wght@300;400;500&display=swap" rel="stylesheet">
 
-<!-- Worker code stored in <script type="text/plain"> — safely inert, no JS escaping issues -->
 <script type="text/plain" id="workerSrc">
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -18,127 +17,418 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (request.method === 'OPTIONS') return new Response(null, { headers: CORS });
+
     if (env.WORKER_SECRET) {
       const auth = request.headers.get('Authorization');
-      if (auth !== 'Bearer ' + env.WORKER_SECRET)
+      if (auth !== 'Bearer ' + env.WORKER_SECRET) {
         return new Response('Unauthorized', { status: 401, headers: CORS });
+      }
     }
-    if (url.pathname === '/listings') return json(await env.KV.get('analyzed_listings', 'json') || [], CORS);
-    if (url.pathname === '/scan')     return json(await runScan(env), CORS);
+
+    if (url.pathname === '/health') {
+      return json({ ok: true, version: '2.1.0', now: new Date().toISOString() }, CORS);
+    }
+
+    if (url.pathname === '/listings') {
+      const listings = await env.KV.get('analyzed_listings', 'json') || [];
+      const stats = await env.KV.get('stats', 'json') || {};
+      return json({ listings, stats }, CORS);
+    }
+
+    if (url.pathname === '/scan') {
+      return json(await runScan(env), CORS);
+    }
+
     if (url.pathname === '/config') {
-      if (request.method === 'POST') { await env.KV.put('config', JSON.stringify(await request.json())); return json({ ok: true }, CORS); }
-      return json(await env.KV.get('config', 'json') || {}, CORS);
+      if (request.method === 'POST') {
+        const cfg = sanitizeConfig(await request.json());
+        await env.KV.put('config', JSON.stringify(cfg));
+        return json({ ok: true, config: cfg }, CORS);
+      }
+      return json(await env.KV.get('config', 'json') || defaultConfig(), CORS);
     }
-    return new Response('Finn Hunter v2', { headers: CORS });
+
+    return new Response('Finn Hunter v4.1', { headers: CORS });
   },
-  async scheduled(event, env, ctx) { ctx.waitUntil(runScan(env)); }
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(runScan(env));
+  }
 };
 
-const json = (d, h) => new Response(JSON.stringify(d), { headers: { ...h, 'Content-Type': 'application/json' } });
+function defaultConfig() {
+  return {
+    searchTerms: [
+      'vintage møbel','retro møbel','mid-century møbel','hans wegner','finn juhl','arne jacobsen',
+      'poul kjærholm','eames stol','teak stol','teak bord','dansk møbel','60-talls møbel',
+      'string hylle','nils strinning','louis poulsen','le klint'
+    ],
+    minScore: 7,
+    minConfidence: 65,
+    maxPrice: null,
+    deepSearchThreshold: 7,
+    maxAnalyzePerScan: 15,
+    cooldownHours: 72,
+    webhookUrl: ''
+  };
+}
+
+function sanitizeConfig(cfg = {}) {
+  const def = defaultConfig();
+  return {
+    searchTerms: Array.isArray(cfg.searchTerms) && cfg.searchTerms.length ? cfg.searchTerms.slice(0, 50) : def.searchTerms,
+    minScore: clampInt(cfg.minScore, 1, 10, def.minScore),
+    minConfidence: clampInt(cfg.minConfidence, 0, 100, def.minConfidence),
+    maxPrice: cfg.maxPrice ? Math.max(0, Number(cfg.maxPrice)) : null,
+    deepSearchThreshold: clampInt(cfg.deepSearchThreshold, 1, 10, def.deepSearchThreshold),
+    maxAnalyzePerScan: clampInt(cfg.maxAnalyzePerScan, 1, 50, def.maxAnalyzePerScan),
+    cooldownHours: clampInt(cfg.cooldownHours, 1, 720, def.cooldownHours),
+    webhookUrl: String(cfg.webhookUrl || '').trim(),
+  };
+}
+
+function clampInt(v, min, max, fallback) {
+  const n = parseInt(v, 10);
+  if (Number.isNaN(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+const json = (d, h) => new Response(JSON.stringify(d), {
+  headers: { ...h, 'Content-Type': 'application/json; charset=utf-8' }
+});
 
 async function runScan(env) {
-  const cfg = await env.KV.get('config', 'json') || {};
-  const terms = cfg.searchTerms || ['vintage møbel','retro møbel','mid-century','hans wegner','finn juhl','arne jacobsen','poul kjærholm','eames','teak stol','teak bord','dansk møbel','60-talls møbel'];
-  const seen = new Set(await env.KV.get('seen_ids', 'json') || []);
-  const fresh = [];
-  for (const t of terms) {
+  const cfg = sanitizeConfig(await env.KV.get('config', 'json') || defaultConfig());
+  const seenIds = new Set(await env.KV.get('seen_ids', 'json') || []);
+  const notifiedAt = await env.KV.get('notified_map', 'json') || {};
+  const freshById = new Map();
+
+  for (const term of cfg.searchTerms) {
     try {
-      const r = await fetch('https://www.finn.no/rss?searchkey=BAP_FORSALE&q=' + encodeURIComponent(t) + '&sort=PUBLISHED_DESC', { headers: { 'User-Agent': 'Mozilla/5.0 FinnHunter/1.0' } });
-      if (!r.ok) continue;
-      for (const item of parseRSS(await r.text())) { if (!seen.has(item.id)) { fresh.push(item); seen.add(item.id); } }
-    } catch(e) { console.error(t, e); }
+      const rssUrl = 'https://www.finn.no/rss?searchkey=BAP_FORSALE&q=' + encodeURIComponent(term) + '&sort=PUBLISHED_DESC';
+      const res = await fetch(rssUrl, {
+        headers: { 'User-Agent': 'Mozilla/5.0 FinnHunter/2.1 (+personal research)' }
+      });
+      if (!res.ok) continue;
+
+      const items = parseRSS(await res.text());
+      for (const item of items) {
+        if (!item.id) continue;
+        if (!freshById.has(item.id) && !seenIds.has(item.id)) {
+          freshById.set(item.id, item);
+        }
+      }
+    } catch (err) {
+      console.error('rss_error', term, err?.message || err);
+    }
   }
-  const toAnalyze = fresh.filter(l => !cfg.maxPrice || !l.price || l.price <= cfg.maxPrice).slice(0, 15);
+
+  let fresh = Array.from(freshById.values());
+
+  if (cfg.maxPrice) {
+    fresh = fresh.filter(l => !l.price || l.price <= cfg.maxPrice);
+  }
+
+  fresh.sort((a, b) => {
+    const ad = a.pubDate ? new Date(a.pubDate).getTime() : 0;
+    const bd = b.pubDate ? new Date(b.pubDate).getTime() : 0;
+    return bd - ad;
+  });
+
+  const toAnalyze = fresh.slice(0, cfg.maxAnalyzePerScan);
   const analyzed = [];
+  let deepSearchedCount = 0;
+  let notifiedCount = 0;
+
   for (const listing of toAnalyze) {
     try {
       let analysis = await analyzeListing(listing, env);
-      if (analysis.score >= (cfg.deepSearchThreshold || 7)) {
+
+      if ((analysis.score || 0) >= cfg.deepSearchThreshold) {
         const deep = await deepResearch(listing, analysis, env);
-        analysis = { ...analysis, ...deep };
+        analysis = mergeAnalysis(listing, analysis, deep);
+        deepSearchedCount += 1;
+      } else {
+        analysis = normalizeAnalysis(listing, analysis);
       }
-      const entry = { ...listing, analysis, scannedAt: new Date().toISOString() };
+
+      const entry = {
+        ...listing,
+        analysis,
+        scannedAt: new Date().toISOString(),
+      };
       analyzed.push(entry);
-      if (analysis.score >= (cfg.minScore || 7) && (env.NOTIFICATION_WEBHOOK_URL || cfg.webhookUrl)) await notify(entry, env.NOTIFICATION_WEBHOOK_URL || cfg.webhookUrl);
-    } catch(e) { console.error('analysefeil', e); }
+
+      const shouldNotify = shouldSendNotification(entry, cfg, notifiedAt[listing.id], cfg.cooldownHours);
+      const webhook = env.NOTIFICATION_WEBHOOK_URL || cfg.webhookUrl;
+
+      if (shouldNotify && webhook) {
+        await notify(entry, webhook);
+        notifiedAt[listing.id] = new Date().toISOString();
+        notifiedCount += 1;
+      }
+    } catch (err) {
+      console.error('analysis_error', listing?.id, err?.message || err);
+    } finally {
+      seenIds.add(listing.id);
+    }
   }
+
   const existing = await env.KV.get('analyzed_listings', 'json') || [];
-  await env.KV.put('analyzed_listings', JSON.stringify([...analyzed, ...existing].slice(0, 300)));
-  await env.KV.put('seen_ids', JSON.stringify([...seen].slice(-5000)));
-  await env.KV.put('last_scan', new Date().toISOString());
-  return { scanned: fresh.length, analyzed: analyzed.length };
+  const merged = dedupeListings([...analyzed, ...existing]).slice(0, 400);
+
+  const stats = {
+    lastScan: new Date().toISOString(),
+    scannedNew: fresh.length,
+    analyzedNow: analyzed.length,
+    deepSearchedNow: deepSearchedCount,
+    notifiedNow: notifiedCount,
+    totalStored: merged.length,
+  };
+
+  await env.KV.put('analyzed_listings', JSON.stringify(merged));
+  await env.KV.put('seen_ids', JSON.stringify(Array.from(seenIds).slice(-7000)));
+  await env.KV.put('notified_map', JSON.stringify(notifiedAt));
+  await env.KV.put('stats', JSON.stringify(stats));
+  await env.KV.put('last_scan', stats.lastScan);
+
+  return stats;
+}
+
+function dedupeListings(listings) {
+  const map = new Map();
+  for (const item of listings) {
+    if (!item?.id) continue;
+    if (!map.has(item.id)) map.set(item.id, item);
+  }
+  return Array.from(map.values()).sort((a, b) => {
+    const as = (a.analysis?.score || 0) * 1000 + (a.analysis?.confidence || 0);
+    const bs = (b.analysis?.score || 0) * 1000 + (b.analysis?.confidence || 0);
+    return bs - as;
+  });
+}
+
+function shouldSendNotification(entry, cfg, lastNotifiedIso, cooldownHours) {
+  const score = entry.analysis?.score || 0;
+  const confidence = entry.analysis?.confidence || 0;
+  if (score < cfg.minScore) return false;
+  if (confidence < cfg.minConfidence) return false;
+
+  if (!lastNotifiedIso) return true;
+  const diffMs = Date.now() - new Date(lastNotifiedIso).getTime();
+  return diffMs >= cooldownHours * 60 * 60 * 1000;
 }
 
 function parseRSS(xml) {
-  const items = []; const rx = /<item>([\s\S]*?)<\/item>/g; let m;
+  const items = [];
+  const rx = /<item>([\s\S]*?)<\/item>/g;
+  let m;
+
   while ((m = rx.exec(xml))) {
     const i = m[1];
-    const title = gt(i,'title'), link = gt(i,'link'), desc = gt(i,'description'), pubDate = gt(i,'pubDate'), guid = gt(i,'guid');
-    const id = (link||guid||'').match(/\/(\d{8,})/)?.[1] || (guid||'').slice(-12);
-    const price = ((desc||'')+(title||'')).match(/(\d[\d\s]{1,6})\s*kr/i)?.[1]?.replace(/\s/g,'') * 1 || null;
-    const imageUrl = (desc||'').match(/src="([^"]+\.(jpg|jpeg|png|webp)[^"]*)"/i)?.[1] || null;
-    if (title && link && id) items.push({ id, title, link, desc, price, imageUrl, pubDate });
+    const title = gt(i, 'title');
+    const link = gt(i, 'link');
+    const desc = gt(i, 'description');
+    const pubDate = gt(i, 'pubDate');
+    const guid = gt(i, 'guid');
+    const id = (link || guid || '').match(/\/(\d{8,})/)?.[1] || (guid || '').slice(-12) || null;
+    const price = ((desc || '') + ' ' + (title || ''))
+      .match(/(\d[\d\s]{1,8})\s*kr/i)?.[1]?.replace(/\s/g, '') * 1 || null;
+    const imageUrl = (desc || '').match(/src="([^"]+\.(jpg|jpeg|png|webp)[^"]*)"/i)?.[1] || null;
+
+    if (title && link && id) {
+      items.push({ id, title, link, desc, price, imageUrl, pubDate });
+    }
   }
   return items;
 }
 
 function gt(xml, name) {
-  return xml.match(new RegExp('<' + name + '[^>]*>(?:<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>|([\\s\\S]*?))</' + name + '>'))?.slice(1).find(Boolean)?.trim() || null;
+  return xml.match(new RegExp('<' + name + '[^>]*>(?:<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>|([\\s\\S]*?))<\\/' + name + '>'))
+    ?.slice(1).find(Boolean)?.trim() || null;
 }
 
 async function analyzeListing(listing, env) {
-  const prompt = 'Du er en ekspert på vintage møbler og skandinavisk design fra 50-70-tallet.\n' +
-    'Analyser denne Finn.no-annonsen og vurder kjøpspotensiale for videresalg.\n\n' +
-    'Tittel: ' + listing.title + '\nPris: ' + (listing.price ? listing.price + ' kr' : 'ikke oppgitt') + '\n' +
-    'Beskrivelse: ' + ((listing.desc||'').replace(/<[^>]+>/g,'').slice(0,400)) + '\n\n' +
-    'Vurder designere (Wegner, Finn Juhl, Kjærholm, Jacobsen, Eames osv.), materialer og om prisen er underpriset.\n\n' +
-    'Svar KUN med gyldig JSON (ingen markdown, ingen forklaring):\n' +
-    '{"score":7,"reason":"Norsk forklaring.","estimatedResalePrice":3000,"potentialProfit":2000,"category":"Stol","designerMatch":"Navn eller null","riskLevel":"low","action":"buy","confidence":55,"confidenceReason":"1 setning.","keywords":["teak"]}';
+  const cleanDesc = (listing.desc || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 600);
+  const prompt =
+    'Du er en ekspert på vintage møbler, skandinavisk design og bruktmarked i Norge.\\n' +
+    'Analyser Finn-annonsen og vurder om den er interessant for videresalg.\\n\\n' +
+    'Tittel: ' + listing.title + '\\n' +
+    'Pris: ' + (listing.price ? listing.price + ' kr' : 'ikke oppgitt') + '\\n' +
+    'Beskrivelse: ' + cleanDesc + '\\n\\n' +
+    'Vurder spesielt: designer-match, materialer, modellhint, feilprising, etterspørsel og usikkerhet.\\n' +
+    'Confidence skal være konservativ hvis du ikke er trygg.\\n\\n' +
+    'Svar KUN med gyldig JSON uten markdown: ' +
+    '{"score":7,"reason":"kort norsk forklaring","estimatedResalePrice":3000,"potentialProfit":2000,"category":"Stol","designerMatch":"Navn eller null","riskLevel":"low|medium|high","action":"buy|maybe|skip","confidence":55,"confidenceReason":"kort grunn","keywords":["teak"]}';
 
   let content = [{ type: 'text', text: prompt }];
+
   if (listing.imageUrl) {
     try {
-      const r = await fetch(listing.imageUrl);
-      if (r.ok) {
-        const buf = await r.arrayBuffer();
-        const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
-        content = [{ type: 'image', source: { type: 'base64', media_type: r.headers.get('content-type') || 'image/jpeg', data: b64 }}, { type: 'text', text: prompt }];
+      const imgRes = await fetch(listing.imageUrl);
+      if (imgRes.ok) {
+        const arr = new Uint8Array(await imgRes.arrayBuffer());
+        const b64 = arrayBufferToBase64(arr);
+        content = [
+          {
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: imgRes.headers.get('content-type') || 'image/jpeg',
+              data: b64,
+            }
+          },
+          { type: 'text', text: prompt }
+        ];
       }
-    } catch(_) {}
+    } catch (_) {}
   }
 
-  const r = await fetch('https://api.anthropic.com/v1/messages', {
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-api-key': env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: 'claude-opus-4-5', max_tokens: 500, messages: [{ role: 'user', content }] })
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({
+      model: 'claude-opus-4-5',
+      max_tokens: 700,
+      messages: [{ role: 'user', content }]
+    })
   });
-  const d = await r.json();
-  try { return JSON.parse((d.content?.[0]?.text || '{}').replace(/```json\n?|\n?```/g,'').trim()); }
-  catch { return { score: 5, reason: 'Analyse feilet', action: 'maybe', riskLevel: 'medium', confidence: 30, confidenceReason: 'Feil under analyse' }; }
+
+  const data = await res.json();
+  try {
+    const text = (data.content?.[0]?.text || '{}').replace(/```json\n?|\n?```/g, '').trim();
+    return normalizeAnalysis(listing, JSON.parse(text));
+  } catch {
+    return normalizeAnalysis(listing, {
+      score: 4,
+      reason: 'Analyse feilet',
+      action: 'maybe',
+      riskLevel: 'medium',
+      confidence: 25,
+      confidenceReason: 'Ustabil AI-respons'
+    });
+  }
 }
 
 async function deepResearch(listing, initial, env) {
-  const prompt = 'Du er en bruktmarked-analytiker. Søk etter faktiske salgspriser for dette møblet.\n\n' +
-    'Møbel: ' + listing.title + '\nFinn-pris: ' + (listing.price ? listing.price + ' kr' : 'ukjent') + '\n' +
-    'Designer: ' + (initial.designerMatch || 'ukjent') + '\nEstimert videresalg: ' + (initial.estimatedResalePrice || '?') + ' kr\n\n' +
-    'Søk på Lauritz, eBay completed, Pamono, 1stDibs, Catawiki og solgte Finn-annonser.\n\n' +
-    'Svar KUN med gyldig JSON:\n' +
-    '{"confidence":82,"confidenceReason":"Fant 4 tilsvarende på Lauritz.","verifiedResalePrice":4800,"marketEvidence":"Lauritz: 4-6k kr, eBay: $450-700","deepSearched":true}';
+  const prompt =
+    'Du er bruktmarked-analytiker for vintage møbler. Finn sammenlignbare salg og aktiv markedspris.\\n\\n' +
+    'Objekt: ' + listing.title + '\\n' +
+    'Finn-pris: ' + (listing.price ? listing.price + ' kr' : 'ukjent') + '\\n' +
+    'Foreløpig kategori: ' + (initial.category || 'ukjent') + '\\n' +
+    'Foreløpig designer-match: ' + (initial.designerMatch || 'ingen sikker match') + '\\n' +
+    'Foreløpig videresalg: ' + (initial.estimatedResalePrice || 'ukjent') + ' kr\\n\\n' +
+    'Søk etter mest relevante sammenligninger på Lauritz, Bukowskis, Catawiki, eBay completed/sold, Pamono, 1stDibs og åpne kilder.\\n' +
+    'Hvis du ikke finner gode treff, senk confidence. Ikke overdriv.\\n\\n' +
+    'Svar KUN med gyldig JSON uten markdown: ' +
+    '{"confidence":82,"confidenceReason":"Fant flere sammenlignbare salg siste 12 mnd","verifiedResalePrice":4800,"marketEvidence":"Lauritz 4–6k, eBay sold 5–7k","deepSearched":true,"comparableCount":4}';
 
-  const r = await fetch('https://api.anthropic.com/v1/messages', {
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-api-key': env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: 'claude-opus-4-5', max_tokens: 1000, tools: [{ type: 'web_search_20250305', name: 'web_search' }], messages: [{ role: 'user', content: prompt }] })
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({
+      model: 'claude-opus-4-5',
+      max_tokens: 1200,
+      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      messages: [{ role: 'user', content: prompt }]
+    })
   });
-  const d = await r.json();
-  const last = ((d.content||[]).filter(b => b.type === 'text').pop())?.text || '{}';
-  try { const m = last.replace(/```json\n?|\n?```/g,'').match(/\{[\s\S]*\}/); return m ? JSON.parse(m[0]) : { confidence: 45, confidenceReason: 'Begrenset data', deepSearched: true }; }
-  catch { return { confidence: 40, confidenceReason: 'Søk gjennomført, uklar konklusjon', deepSearched: true }; }
+
+  const data = await res.json();
+  const lastText = ((data.content || []).filter(x => x.type === 'text').pop())?.text || '{}';
+
+  try {
+    const match = lastText.replace(/```json\n?|\n?```/g, '').match(/\{[\s\S]*\}/);
+    return match ? JSON.parse(match[0]) : { deepSearched: true, confidence: initial.confidence || 40 };
+  } catch {
+    return { deepSearched: true, confidence: Math.min(initial.confidence || 40, 45), confidenceReason: 'Web-søk ga uklar konklusjon' };
+  }
+}
+
+function mergeAnalysis(listing, initial, deep) {
+  const out = { ...initial, ...deep, deepSearched: true };
+  return normalizeAnalysis(listing, out);
+}
+
+function normalizeAnalysis(listing, analysis) {
+  const price = listing.price || 0;
+  const estimated = numberOrNull(analysis.verifiedResalePrice ?? analysis.estimatedResalePrice);
+  const profit = estimated != null && price ? Math.max(0, estimated - price) : numberOrNull(analysis.potentialProfit);
+
+  return {
+    score: clampInt(analysis.score, 1, 10, 5),
+    reason: String(analysis.reason || 'Ingen begrunnelse').slice(0, 280),
+    estimatedResalePrice: numberOrNull(analysis.estimatedResalePrice),
+    verifiedResalePrice: numberOrNull(analysis.verifiedResalePrice),
+    potentialProfit: profit,
+    category: String(analysis.category || '').slice(0, 40),
+    designerMatch: analysis.designerMatch ? String(analysis.designerMatch).slice(0, 80) : null,
+    riskLevel: ['low', 'medium', 'high'].includes(analysis.riskLevel) ? analysis.riskLevel : 'medium',
+    action: ['buy', 'maybe', 'skip'].includes(analysis.action) ? analysis.action : 'maybe',
+    confidence: clampInt(analysis.confidence, 0, 100, fallbackConfidence(analysis)),
+    confidenceReason: String(analysis.confidenceReason || '').slice(0, 180),
+    keywords: Array.isArray(analysis.keywords) ? analysis.keywords.slice(0, 8).map(x => String(x).slice(0, 30)) : [],
+    marketEvidence: analysis.marketEvidence ? String(analysis.marketEvidence).slice(0, 240) : '',
+    deepSearched: !!analysis.deepSearched,
+    comparableCount: numberOrNull(analysis.comparableCount),
+  };
+}
+
+function fallbackConfidence(analysis) {
+  if ((analysis.score || 0) >= 9 && analysis.designerMatch) return 68;
+  if ((analysis.score || 0) >= 8 && analysis.designerMatch) return 58;
+  if ((analysis.score || 0) >= 7) return 46;
+  if ((analysis.score || 0) >= 5) return 32;
+  return 18;
+}
+
+function numberOrNull(v) {
+  if (v == null || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.round(n) : null;
+}
+
+function arrayBufferToBase64(bytes) {
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
 }
 
 async function notify(entry, url) {
-  await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ title: 'Finn-funn: ' + entry.title, score: entry.analysis?.score, confidence: entry.analysis?.confidence, price: entry.price, resalePrice: entry.analysis?.verifiedResalePrice || entry.analysis?.estimatedResalePrice, profit: entry.analysis?.potentialProfit, reason: entry.analysis?.reason, marketEvidence: entry.analysis?.marketEvidence, designer: entry.analysis?.designerMatch, link: entry.link, image: entry.imageUrl, timestamp: entry.scannedAt })
+  const analysis = entry.analysis || {};
+  await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      title: 'Finn-funn: ' + entry.title,
+      listingId: entry.id,
+      score: analysis.score,
+      confidence: analysis.confidence,
+      price: entry.price,
+      resalePrice: analysis.verifiedResalePrice || analysis.estimatedResalePrice,
+      profit: analysis.potentialProfit,
+      reason: analysis.reason,
+      confidenceReason: analysis.confidenceReason,
+      marketEvidence: analysis.marketEvidence,
+      designer: analysis.designerMatch,
+      deepSearched: analysis.deepSearched,
+      comparableCount: analysis.comparableCount,
+      riskLevel: analysis.riskLevel,
+      link: entry.link,
+      image: entry.imageUrl,
+      timestamp: entry.scannedAt,
+    })
   });
 }
 </script>
@@ -157,8 +447,6 @@ async function notify(entry, url) {
 }
 html{font-size:16px}
 body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-weight:300;min-height:100vh}
-
-/* HEADER */
 .hdr{background:var(--surface);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:50}
 .hdr-in{max-width:1400px;margin:0 auto;padding:0 2rem;display:flex;align-items:center;justify-content:space-between;height:58px}
 .brand{font-family:var(--serif);font-size:1.35rem;font-weight:400;letter-spacing:.14em;text-transform:uppercase}
@@ -169,33 +457,26 @@ body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-weight:3
 .dot.busy{background:var(--accent);animation:blink .8s infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
 .dot-lbl{font-size:.68rem;letter-spacing:.09em;color:var(--ink3);text-transform:uppercase}
-
-/* NAV */
 .nav{background:var(--surface);border-bottom:1px solid var(--border);padding:0 2rem;display:flex}
 .ntab{font-family:var(--sans);font-size:.7rem;font-weight:400;letter-spacing:.1em;text-transform:uppercase;color:var(--ink3);padding:.75rem 1.1rem;cursor:pointer;border:none;border-bottom:2px solid transparent;background:none;transition:color .15s,border-color .15s}
 .ntab:hover{color:var(--ink)}
 .ntab.on{color:var(--ink);border-bottom-color:var(--ink)}
-
-/* PAGES */
 .pg{display:none}
 .pg.on{display:block}
 .wrap{max-width:1400px;margin:0 auto;padding:2rem}
-
-/* STATS */
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--border);border:1px solid var(--border);border-radius:4px;overflow:hidden;margin-bottom:2rem}
+.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:1px;background:var(--border);border:1px solid var(--border);border-radius:4px;overflow:hidden;margin-bottom:2rem}
 .stat{background:var(--surface);padding:1.2rem 1.5rem}
 .stat-lbl{font-size:.63rem;letter-spacing:.12em;text-transform:uppercase;color:var(--ink3);margin-bottom:.3rem}
 .stat-val{font-family:var(--serif);font-size:2.1rem;font-weight:300;color:var(--ink);line-height:1}
 .stat-val.g{color:var(--green)}
 .stat-val.a{color:var(--accent)}
 .stat-sub{font-size:.63rem;color:var(--ink3);margin-top:.2rem}
-
-/* TOOLBAR */
 .bar{display:flex;align-items:center;justify-content:space-between;gap:1rem;margin-bottom:1.5rem;flex-wrap:wrap}
 .bar-l,.bar-r{display:flex;align-items:center;gap:.4rem;flex-wrap:wrap}
 .chip{font-size:.67rem;font-weight:400;letter-spacing:.05em;padding:.28rem .85rem;border:1px solid var(--border2);border-radius:100px;cursor:pointer;background:transparent;color:var(--ink2);transition:all .15s}
 .chip:hover{border-color:var(--ink2);color:var(--ink)}
 .chip.on{background:var(--ink);border-color:var(--ink);color:#fff}
+.sel{font-family:var(--sans);font-size:.7rem;border:1px solid var(--border2);background:transparent;color:var(--ink2);padding:.42rem .7rem;border-radius:999px}
 .btn{font-family:var(--sans);font-size:.7rem;font-weight:400;letter-spacing:.08em;text-transform:uppercase;padding:.45rem 1.1rem;border-radius:2px;cursor:pointer;border:none;transition:all .15s}
 .btn-dark{background:var(--ink);color:#fff}
 .btn-dark:hover{background:#3c3836}
@@ -203,44 +484,34 @@ body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-weight:3
 .btn-out{background:transparent;border:1px solid var(--border2);color:var(--ink2)}
 .btn-out:hover{border-color:var(--ink2);color:var(--ink)}
 .scan-lbl{font-size:.63rem;color:var(--ink3)}
-
-/* GRID */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(296px,1fr));gap:1.4rem}
-
-/* CARD */
 .card{background:var(--surface);border:1px solid var(--border);border-radius:4px;overflow:hidden;transition:box-shadow .2s,transform .2s;animation:up .32s ease both}
 .card:hover{box-shadow:0 6px 20px rgba(0,0,0,.08);transform:translateY(-2px)}
 @keyframes up{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
-
 .cimg{aspect-ratio:4/3;overflow:hidden;background:var(--bg);position:relative}
 .cimg img{width:100%;height:100%;object-fit:cover;transition:transform .4s ease}
 .card:hover .cimg img{transform:scale(1.04)}
 .cimg-empty{width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:var(--border2);font-size:2.4rem}
 .cbadges{position:absolute;top:.7rem;left:.7rem;right:.7rem;display:flex;justify-content:space-between;align-items:flex-start}
-
 .score{width:2rem;height:2rem;border-radius:50%;display:flex;align-items:center;justify-content:center;font-family:var(--serif);font-size:1rem;font-weight:600;color:#fff;flex-shrink:0}
 .s9{background:var(--green)}
 .s7{background:#b45309}
 .s5{background:#6b7280}
 .s0{background:#9ca3af}
-
 .atag{font-size:.58rem;letter-spacing:.09em;text-transform:uppercase;padding:.18rem .5rem;border-radius:2px;font-weight:400}
 .abuy{background:var(--green-bg);color:var(--green);border:1px solid var(--green-border)}
 .amaybe{background:var(--amber-bg);color:var(--amber);border:1px solid var(--accent-border)}
 .askip{background:#f9fafb;color:var(--ink3);border:1px solid var(--border)}
-
 .cbody{padding:1rem 1.1rem 0}
-.ctop{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:.3rem}
+.ctop{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:.3rem;gap:.5rem}
 .ccat{font-size:.61rem;letter-spacing:.12em;text-transform:uppercase;color:var(--ink3)}
-.cdes{font-size:.61rem;color:var(--accent);font-style:italic}
+.cdes{font-size:.61rem;color:var(--accent);font-style:italic;text-align:right}
 .ctitle{font-family:var(--serif);font-size:1.05rem;font-weight:500;line-height:1.35;color:var(--ink);margin-bottom:.45rem;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .creason{font-size:.76rem;color:var(--ink2);line-height:1.55;font-style:italic;margin-bottom:.75rem;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-
-/* CONFIDENCE */
 .conf-wrap{margin-bottom:.85rem}
-.conf-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:.22rem}
+.conf-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:.22rem;gap:.5rem}
 .conf-lbl{font-size:.59rem;letter-spacing:.1em;text-transform:uppercase;color:var(--ink3)}
-.conf-right{display:flex;align-items:center;gap:.35rem}
+.conf-right{display:flex;align-items:center;gap:.35rem;flex-wrap:wrap;justify-content:flex-end}
 .verified{font-size:.53rem;letter-spacing:.07em;text-transform:uppercase;padding:.1rem .38rem;border-radius:100px;background:var(--green-bg);color:var(--green);border:1px solid var(--green-border)}
 .cpct{font-family:var(--serif);font-size:1.1rem;font-weight:500}
 .cpct.hi{color:var(--green)}
@@ -253,31 +524,26 @@ body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-weight:3
 .cfill.lo{background:var(--border2)}
 .cnote{font-size:.61rem;color:var(--ink3);margin-top:.28rem;line-height:1.45}
 .mevidence{font-size:.61rem;color:var(--green);margin-top:.18rem;line-height:1.45;padding-left:.5rem;border-left:2px solid var(--green-border)}
-
-/* PRICES */
+.kw{display:flex;flex-wrap:wrap;gap:.3rem;margin-bottom:.8rem}
+.kw span{font-size:.54rem;padding:.16rem .4rem;border-radius:100px;background:var(--bg);border:1px solid var(--border);color:var(--ink2)}
 .cprices{display:grid;grid-template-columns:1fr 1fr 1fr;border-top:1px solid var(--border);padding:.65rem 0;gap:.4rem}
 .pcol{text-align:center}
 .plbl{display:block;font-size:.54rem;letter-spacing:.1em;text-transform:uppercase;color:var(--ink3);margin-bottom:.18rem}
 .pval{font-family:var(--serif);font-size:1.05rem;font-weight:400;color:var(--ink)}
 .pval.profit{color:var(--green)}
 .pval.na{color:var(--border2);font-size:.85rem}
-
-.cfooter{border-top:1px solid var(--border);padding:.5rem 1.1rem;display:flex;align-items:center;justify-content:space-between}
+.cfooter{border-top:1px solid var(--border);padding:.5rem 1.1rem;display:flex;align-items:center;justify-content:space-between;gap:.5rem}
 .cdate{font-size:.61rem;color:var(--ink3)}
 .rpill{font-size:.57rem;letter-spacing:.07em;text-transform:uppercase;padding:.1rem .38rem;border-radius:2px}
 .rlow{background:var(--green-bg);color:var(--green)}
 .rmed{background:var(--amber-bg);color:var(--amber)}
 .rhi{background:var(--red-bg);color:var(--red)}
-.clink{font-size:.64rem;color:var(--ink);text-decoration:none;letter-spacing:.05em}
+.clink{font-size:.64rem;color:var(--ink);text-decoration:none;letter-spacing:.05em;white-space:nowrap}
 .clink:hover{color:var(--accent)}
-
-/* EMPTY */
 .empty{text-align:center;padding:5rem 2rem;color:var(--ink3)}
 .empty-icon{font-size:2.8rem;margin-bottom:1rem;opacity:.35}
 .empty-title{font-family:var(--serif);font-size:1.4rem;color:var(--ink2);margin-bottom:.4rem}
 .empty-sub{font-size:.8rem;line-height:1.7}
-
-/* SETUP */
 .setup-wrap{min-height:calc(100vh - 0px);display:flex;align-items:center;justify-content:center;padding:2rem;background:var(--bg)}
 .setup-card{max-width:420px;width:100%;background:var(--surface);border:1px solid var(--border);border-radius:4px;overflow:hidden}
 .setup-head{padding:2.5rem 2rem 2rem;text-align:center;border-bottom:1px solid var(--border)}
@@ -286,17 +552,13 @@ body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-weight:3
 .setup-sub{font-size:.7rem;letter-spacing:.1em;text-transform:uppercase;color:var(--ink3)}
 .setup-body{padding:1.8rem 2rem;display:flex;flex-direction:column;gap:1.1rem}
 .notice{background:var(--accent-bg);border:1px solid var(--accent-border);border-radius:3px;padding:.75rem 1rem;font-size:.76rem;color:var(--amber);line-height:1.55}
-
-/* FIELDS */
 .field{display:flex;flex-direction:column;gap:.33rem}
 .flbl{font-size:.63rem;letter-spacing:.1em;text-transform:uppercase;color:var(--ink3)}
 .finp{background:var(--bg);border:1px solid var(--border);border-radius:2px;padding:.58rem .8rem;font-family:var(--sans);font-size:.83rem;color:var(--ink);transition:border-color .15s;width:100%}
 .finp:focus{outline:none;border-color:var(--ink2)}
 .finp::placeholder{color:var(--ink3)}
 textarea.finp{resize:vertical;min-height:68px}
-
-/* SETTINGS */
-.sett-wrap{max-width:660px;margin:0 auto}
+.sett-wrap{max-width:760px;margin:0 auto}
 .ssec{background:var(--surface);border:1px solid var(--border);border-radius:4px;margin-bottom:1.4rem}
 .ssec-head{padding:.9rem 1.3rem;border-bottom:1px solid var(--border)}
 .ssec-title{font-size:.7rem;letter-spacing:.12em;text-transform:uppercase;color:var(--ink2)}
@@ -308,8 +570,6 @@ textarea.finp{resize:vertical;min-height:68px}
 .tremove:hover{color:var(--red)}
 .tag-add{display:flex;gap:.5rem}
 .tag-add .finp{flex:1}
-
-/* WORKER */
 .wkr-wrap{max-width:820px;margin:0 auto}
 .step{display:flex;gap:1.5rem;margin-bottom:2rem;padding-bottom:2rem;border-bottom:1px solid var(--border)}
 .step:last-child{border-bottom:none}
@@ -322,38 +582,27 @@ textarea.finp{resize:vertical;min-height:68px}
 .cpybtn{position:absolute;top:.55rem;right:.55rem;font-family:var(--sans);font-size:.58rem;letter-spacing:.08em;text-transform:uppercase;padding:.22rem .55rem;border:1px solid #3c3836;border-radius:2px;background:transparent;color:#78716c;cursor:pointer;transition:all .15s}
 .cpybtn:hover{border-color:#78716c;color:#d6d3cc}
 .cpybtn.ok{border-color:var(--green);color:#86efac}
-
-/* ALERT */
 .alertbar{margin:0 2rem;padding:.65rem 1rem;border-radius:3px;font-size:.74rem;display:none}
 .alertbar.on{display:block}
 .alert-ok{background:var(--green-bg);border:1px solid var(--green-border);color:var(--green)}
 .alert-err{background:var(--red-bg);border:1px solid #fecdd3;color:var(--red)}
-
 ::-webkit-scrollbar{width:4px;height:4px}
 ::-webkit-scrollbar-track{background:var(--bg)}
 ::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
 ::-webkit-scrollbar-thumb:hover{background:var(--ink3)}
-
-@media(max-width:640px){
-  .stats{grid-template-columns:1fr 1fr}
-  .grid{grid-template-columns:1fr}
-  .wrap{padding:1.2rem}
-  .hdr-in{padding:0 1rem}
-  .nav{padding:0 1rem}
-}
+@media(max-width:900px){.stats{grid-template-columns:1fr 1fr 1fr}.field-row{grid-template-columns:1fr}}
+@media(max-width:640px){.stats{grid-template-columns:1fr 1fr}.grid{grid-template-columns:1fr}.wrap{padding:1.2rem}.hdr-in{padding:0 1rem}.nav{padding:0 1rem}.bar{align-items:flex-start}.cfooter{flex-wrap:wrap}}
 </style>
 </head>
 <body>
-
-<!-- SETUP -->
 <div id="S" class="setup-wrap">
   <div class="setup-card">
     <div class="setup-head">
       <div class="setup-logo">Finn <em>Hunter</em></div>
-      <div class="setup-sub">Automatisk møbeljakt · AI-analyse</div>
+      <div class="setup-sub">Automatisk møbeljakt · AI-analyse · tracked comps</div>
     </div>
     <div class="setup-body">
-      <div class="notice">Denne appen krever en Cloudflare Worker backend. Se «Worker»-fanen for instruksjoner.</div>
+      <div class="notice">Denne appen krever en Cloudflare Worker backend. Se «Worker»-fanen for oppsett og bruk demo-modus for å teste UI-et.</div>
       <div class="field">
         <label class="flbl">Worker URL</label>
         <input type="url" id="wUrl" class="finp" placeholder="https://finn-hunter.din-bruker.workers.dev">
@@ -370,7 +619,6 @@ textarea.finp{resize:vertical;min-height:68px}
   </div>
 </div>
 
-<!-- APP -->
 <div id="A" style="display:none">
   <header class="hdr">
     <div class="hdr-in">
@@ -381,22 +629,27 @@ textarea.finp{resize:vertical;min-height:68px}
       </div>
     </div>
   </header>
+
   <nav class="nav">
     <button class="ntab on" onclick="pg('listings',this)">Funn</button>
     <button class="ntab" onclick="pg('settings',this)">Innstillinger</button>
     <button class="ntab" onclick="pg('worker',this)">Worker</button>
+    <button class="ntab" onclick="pg('tracked',this)">Tracked comps</button>
+    <button class="ntab" onclick="pg('seo',this)">SEO</button>
   </nav>
+
   <div id="alertBar" class="alertbar"></div>
 
-  <!-- LISTINGS -->
   <div id="p-listings" class="pg on">
     <div class="wrap">
       <div class="stats">
         <div class="stat"><div class="stat-lbl">Totalt analysert</div><div class="stat-val" id="stotal">—</div><div class="stat-sub">annonser</div></div>
-        <div class="stat"><div class="stat-lbl">Kjøp nå</div><div class="stat-val a" id="sbuy">—</div><div class="stat-sub">score ≥ 8</div></div>
-        <div class="stat"><div class="stat-lbl">Vurder</div><div class="stat-val" id="smaybe" style="color:#b45309">—</div><div class="stat-sub">score 5–7</div></div>
+        <div class="stat"><div class="stat-lbl">Kjøp nå</div><div class="stat-val a" id="sbuy">—</div><div class="stat-sub">action=buy</div></div>
+        <div class="stat"><div class="stat-lbl">Web-verifisert</div><div class="stat-val" id="sdeep" style="color:#b45309">—</div><div class="stat-sub">deep research</div></div>
+        <div class="stat"><div class="stat-lbl">Høy confidence</div><div class="stat-val" id="shighconf" style="color:#2d6a4f">—</div><div class="stat-sub">≥ 80%</div></div>
         <div class="stat"><div class="stat-lbl">Beste profitt</div><div class="stat-val g" id="sprofit">—</div><div class="stat-sub">estimert kr</div></div>
       </div>
+
       <div class="bar">
         <div class="bar-l">
           <span style="font-size:.63rem;color:var(--ink3);letter-spacing:.08em;text-transform:uppercase">Filter</span>
@@ -406,20 +659,28 @@ textarea.finp{resize:vertical;min-height:68px}
           <button class="chip" onclick="filt('hs',this)">Score ≥ 8</button>
           <button class="chip" onclick="filt('des',this)">Designer</button>
           <button class="chip" onclick="filt('ver',this)">Web-verifisert</button>
+          <button class="chip" onclick="filt('conf',this)">Confidence ≥ 80%</button>
         </div>
         <div class="bar-r">
+          <select id="sortSel" class="sel" onchange="render()">
+            <option value="hybrid">Sorter: score + confidence</option>
+            <option value="profit">Sorter: profitt</option>
+            <option value="confidence">Sorter: confidence</option>
+            <option value="priceAsc">Sorter: pris lav-høy</option>
+            <option value="newest">Sorter: nyeste først</option>
+          </select>
           <span class="scan-lbl" id="scanLbl"></span>
           <button class="btn btn-out" onclick="load()">↻</button>
           <button class="btn btn-dark" id="scanbtn" onclick="scan()">Skann nå</button>
         </div>
       </div>
+
       <div id="listingsOut">
-        <div class="empty"><div class="empty-icon">🪑</div><div class="empty-title">Ingen funn ennå</div><div class="empty-sub">Trykk «Skann nå» for å starte,<br>eller vent på automatisk skanning</div></div>
+        <div class="empty"><div class="empty-icon">🪑</div><div class="empty-title">Ingen funn ennå</div><div class="empty-sub">Trykk «Skann nå» for å starte,<br>eller vent på automatisk skanning.</div></div>
       </div>
     </div>
   </div>
 
-  <!-- SETTINGS -->
   <div id="p-settings" class="pg">
     <div class="wrap">
       <div class="sett-wrap">
@@ -436,23 +697,33 @@ textarea.finp{resize:vertical;min-height:68px}
             </div>
           </div>
         </div>
+
         <div class="ssec">
-          <div class="ssec-head"><div class="ssec-title">Filterkriterier</div></div>
+          <div class="ssec-head"><div class="ssec-title">Scan-kriterier</div></div>
           <div class="ssec-body">
             <div class="field-row">
               <div class="field"><label class="flbl">Min. score for varsling</label><input type="number" id="minScore" class="finp" min="1" max="10" placeholder="7"></div>
-              <div class="field"><label class="flbl">Maks pris NOK</label><input type="number" id="maxPrice" class="finp" placeholder="10000"></div>
+              <div class="field"><label class="flbl">Min. confidence for varsling</label><input type="number" id="minConf" class="finp" min="0" max="100" placeholder="65"></div>
             </div>
-            <div class="field"><label class="flbl">Deep search terskel (score ≥ X kjører nettverifisering)</label><input type="number" id="deepThr" class="finp" min="1" max="10" placeholder="7"></div>
+            <div class="field-row">
+              <div class="field"><label class="flbl">Maks pris NOK</label><input type="number" id="maxPrice" class="finp" placeholder="10000"></div>
+              <div class="field"><label class="flbl">Deep search terskel (score ≥ X)</label><input type="number" id="deepThr" class="finp" min="1" max="10" placeholder="7"></div>
+            </div>
+            <div class="field-row">
+              <div class="field"><label class="flbl">Maks analyser per scan</label><input type="number" id="maxAnalyze" class="finp" min="1" max="50" placeholder="15"></div>
+              <div class="field"><label class="flbl">Varslings-cooldown (timer)</label><input type="number" id="cooldown" class="finp" min="1" max="720" placeholder="72"></div>
+            </div>
           </div>
         </div>
+
         <div class="ssec">
           <div class="ssec-head"><div class="ssec-title">Varsler</div></div>
           <div class="ssec-body">
-            <div class="field"><label class="flbl">Webhook URL (Make.com, Zapier...)</label><input type="url" id="webhook" class="finp" placeholder="https://hook.eu1.make.com/..."></div>
-            <p style="font-size:.74rem;color:var(--ink3);font-style:italic;line-height:1.65">Finn Hunter poster til webhook når et funn passerer minimum score. Bruk Make.com til å videresende til e-post, SMS eller Slack.</p>
+            <div class="field"><label class="flbl">Webhook URL (Make.com, Zapier, n8n...)</label><input type="url" id="webhook" class="finp" placeholder="https://hook.eu1.make.com/..." /></div>
+            <p style="font-size:.74rem;color:var(--ink3);font-style:italic;line-height:1.65">Nå varsles bare funn som passerer både minimum score og minimum confidence. Det reduserer falske positiver.</p>
           </div>
         </div>
+
         <div style="display:flex;gap:.8rem">
           <button class="btn btn-dark" onclick="saveS()">Lagre</button>
           <button class="btn btn-out" onclick="loadS()">Tilbakestill</button>
@@ -461,14 +732,14 @@ textarea.finp{resize:vertical;min-height:68px}
     </div>
   </div>
 
-  <!-- WORKER -->
   <div id="p-worker" class="pg">
     <div class="wrap">
       <div class="wkr-wrap">
         <div style="margin-bottom:2rem">
           <h1 style="font-family:var(--serif);font-size:1.75rem;font-weight:300;letter-spacing:.05em;margin-bottom:.4rem">Cloudflare Worker Setup</h1>
-          <p style="font-size:.8rem;color:var(--ink2);line-height:1.7;font-style:italic">Finn Hunter kjører som en Cloudflare Worker med cron-trigger og KV-lagring. To-trinns AI-analyse: rask første analyse, deretter web_search-verifisering for høy-score funn.</p>
+          <p style="font-size:.8rem;color:var(--ink2);line-height:1.7;font-style:italic">Denne versjonen gir deg mer konservativ confidence, notifikasjons-cooldown, bedre profit-beregning og mer robust håndtering av bilder og duplikater.</p>
         </div>
+
         <div class="step">
           <div class="snum">01</div>
           <div class="scon">
@@ -481,6 +752,7 @@ wrangler init --no-bundle
 wrangler kv:namespace create FINN_HUNTER_KV</div>
           </div>
         </div>
+
         <div class="step">
           <div class="snum">02</div>
           <div class="scon">
@@ -498,19 +770,21 @@ id = "DIN_KV_NAMESPACE_ID_HER"
 crons = ["0 */2 * * *"]</div>
           </div>
         </div>
+
         <div class="step">
           <div class="snum">03</div>
           <div class="scon">
             <div class="stitle">worker.js — komplett kode</div>
-            <div class="sdesc">RSS-henting, Claude Vision-analyse, deep research med web_search, KV-lagring og webhook-varsler.</div>
+            <div class="sdesc">RSS-henting, Claude Vision-analyse, deep research, confidence-normalisering og webhook-varsler.</div>
             <div class="wkr-code" id="wkrDisplay"><button class="cpybtn" onclick="cpyWkr(this)">Kopier alt</button></div>
           </div>
         </div>
+
         <div class="step">
           <div class="snum">04</div>
           <div class="scon">
             <div class="stitle">Deploy og sett secrets</div>
-            <div class="sdesc">Sett API-nøkler som secrets (aldri i wrangler.toml) og deploy.</div>
+            <div class="sdesc">Sett API-nøkler som secrets og deploy workeren.</div>
             <div class="codeblk"><button class="cpybtn" onclick="cpyBlk(this)">Kopier</button>wrangler secret put ANTHROPIC_API_KEY
 wrangler secret put WORKER_SECRET
 wrangler secret put NOTIFICATION_WEBHOOK_URL
@@ -524,23 +798,68 @@ curl https://finn-hunter.din.workers.dev/scan \
         </div>
       </div>
     </div>
+  
+  <!-- TRACKED COMPS -->
+  <div id="p-tracked" class="pg">
+    <div class="wrap">
+      <div class="sett-wrap">
+        <div class="ssec">
+          <div class="ssec-head"><div class="ssec-title">Tracked comparables</div></div>
+          <div class="ssec-body">
+            <p style="font-size:.78rem;color:var(--ink2);line-height:1.7">Bruk denne fanen til å følge relevante FINN-annonser over tid og bygge egen comps-historikk. I denne previewen er innholdet demonstrasjonsdata for UI og flyt.</p>
+            <div class="field">
+              <label class="flbl">Legg til FINN-lenke</label>
+              <div class="tag-add">
+                <input type="url" class="finp" placeholder="https://www.finn.no/...">
+                <button class="btn btn-out">Track comp</button>
+              </div>
+            </div>
+            <div class="grid" style="margin-top:.5rem">
+              <div class="card"><div class="cbody" style="padding-bottom:1rem"><div class="ctop"><span class="ccat">Stol</span><span class="cdes">Hans J. Wegner</span></div><div class="ctitle">CH24 / Y-stol — tracked comp</div><div class="creason">Sist sett aktiv til 4 900 kr. Relevant comp for danske teakstoler og designikoner.</div><div class="conf-wrap"><div class="conf-top"><span class="conf-lbl">Status</span><div class="conf-right"><span class="verified">◉ Active</span></div></div><div class="cnote">Sist oppdatert: i dag</div><div class="mevidence">Ask price: 4 900 kr · 12 dager live · Oslo</div></div></div><div class="cfooter"><span class="cdate">Comp #001</span><a href="#" class="clink">Åpne →</a></div></div>
+              <div class="card"><div class="cbody" style="padding-bottom:1rem"><div class="ctop"><span class="ccat">Skjenk</span><span class="cdes">Gillis Lundgren</span></div><div class="ctitle">Excellent skjenk i palisander — tracked comp</div><div class="creason">Eksempel på comp som senere kan flyttes til historikk når annonsen blir solgt eller fjernet.</div><div class="conf-wrap"><div class="conf-top"><span class="conf-lbl">Status</span><div class="conf-right"><span class="verified">◉ Sold</span></div></div><div class="cnote">Sist oppdatert: 3 dager siden</div><div class="mevidence">Last seen price: 6 500 kr · solgt/avsluttet observert</div></div></div><div class="cfooter"><span class="cdate">Comp #002</span><a href="#" class="clink">Åpne →</a></div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
+
+  <!-- SEO -->
+  <div id="p-seo" class="pg">
+    <div class="wrap">
+      <div class="sett-wrap">
+        <div class="ssec">
+          <div class="ssec-head"><div class="ssec-title">FINN annonseforbedrer</div></div>
+          <div class="ssec-body">
+            <p style="font-size:.78rem;color:var(--ink2);line-height:1.7">Skriv inn produktnavn og noen nøkkelopplysninger. Agenten kan foreslå bedre tittel, søkefraser og annonsetekst for videresalg.</p>
+            <div class="field"><label class="flbl">Produkt</label><input class="finp" value="Vintage teak skjenk av Gillis Lundgren"></div>
+            <div class="field"><label class="flbl">Forslag til tittel</label><textarea class="finp">Vintage teak skjenk av Gillis Lundgren – palisander look – retro / dansk modern / IKEA design</textarea></div>
+            <div class="field"><label class="flbl">Søkefraser</label><textarea class="finp">vintage teak skjenk, Gillis Lundgren, retro skjenk, dansk modern, palisander skjenk, IKEA vintage</textarea></div>
+            <div class="field"><label class="flbl">Forbedret annonsetekst</label><textarea class="finp" style="min-height:140px">Selger en flott vintage skjenk i teak utførelse med tydelig retropreg. Perfekt for deg som liker skandinavisk design, dansk modern og klassiske møbler fra 60- og 70-tallet. Skjenken passer godt i stue, gang eller spisestue og har god oppbevaringsplass.</textarea></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
 </div>
 
 <script>
-var ST = { url:'', sec:'', listings:[], filter:'all', cfg:null };
+var ST = { url:'', sec:'', listings:[], stats:{}, filter:'all', cfg:null };
 var DEF_TERMS = ['vintage møbel','retro møbel','mid-century møbel','hans wegner','finn juhl','arne jacobsen','poul kjærholm','eames stol','teak stol','teak bord','dansk møbel','60-talls møbel','string hylle','nils strinning','louis poulsen','le klint'];
 var terms = DEF_TERMS.slice();
 
 window.addEventListener('load', function() {
-  // Inject worker code safely from the inert script tag
   var src = document.getElementById('workerSrc').textContent;
-  var dsp = document.getElementById('wkrDisplay');
-  dsp.appendChild(document.createTextNode(src));
+  document.getElementById('wkrDisplay').appendChild(document.createTextNode(src));
 
   var saved = sessionStorage.getItem('fhc');
   if (saved) {
-    try { var c = JSON.parse(saved); ST.url = c.u; ST.sec = c.s; launch(false); } catch(e) {}
+    try {
+      var c = JSON.parse(saved);
+      ST.url = c.u; ST.sec = c.s;
+      launch(false);
+    } catch(e) {}
   }
 });
 
@@ -559,26 +878,45 @@ function launch(isDemo) {
   document.getElementById('S').style.display = 'none';
   document.getElementById('A').style.display = 'block';
   setDot('live','Tilkoblet');
-  if (isDemo) loadDemo();
-  else { load(); loadS(); }
+  if (isDemo) loadDemo(); else { load(); loadS(); }
 }
 
 function apiFetch(path, opts) {
   var h = {'Content-Type':'application/json'};
   if (ST.sec) h['Authorization'] = 'Bearer ' + ST.sec;
-  return fetch(ST.url + path, Object.assign({}, opts || {}, {headers: Object.assign(h, (opts||{}).headers||{})})).then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); });
+  return fetch(ST.url + path, Object.assign({}, opts || {}, { headers: Object.assign(h, (opts||{}).headers||{}) }))
+    .then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); });
 }
 
 function load() {
   setDot('busy','Laster...');
-  apiFetch('/listings').then(function(d){ ST.listings = d||[]; render(); document.getElementById('scanLbl').textContent = 'Oppdatert '+new Date().toLocaleTimeString('nb-NO'); setDot('live','Tilkoblet'); }).catch(function(e){ flash('Feil: '+e.message,'err'); setDot('live','Tilkoblet'); });
+  apiFetch('/listings').then(function(d){
+    ST.listings = Array.isArray(d) ? d : (d.listings || []);
+    ST.stats = d.stats || {};
+    render();
+    var last = ST.stats.lastScan ? new Date(ST.stats.lastScan).toLocaleTimeString('nb-NO') : new Date().toLocaleTimeString('nb-NO');
+    document.getElementById('scanLbl').textContent = 'Oppdatert ' + last;
+    setDot('live','Tilkoblet');
+  }).catch(function(e){ flash('Feil: ' + e.message,'err'); setDot('live','Tilkoblet'); });
 }
 
 function scan() {
   var btn = document.getElementById('scanbtn');
   btn.disabled = true; btn.textContent = 'Scanner…';
   setDot('busy','Scanner');
-  apiFetch('/scan').then(function(r){ flash('Ferdig: '+r.scanned+' nye, '+r.analyzed+' analysert','ok'); return apiFetch('/listings'); }).then(function(d){ ST.listings=d||[]; render(); }).catch(function(e){ flash('Feil: '+e.message,'err'); }).finally(function(){ btn.disabled=false; btn.textContent='Skann nå'; setDot('live','Tilkoblet'); });
+  apiFetch('/scan').then(function(r){
+    flash('Scan ferdig: ' + r.analyzedNow + ' analysert · ' + r.deepSearchedNow + ' web-verifisert · ' + r.notifiedNow + ' varsler sendt','ok');
+    return apiFetch('/listings');
+  }).then(function(d){
+    ST.listings = Array.isArray(d) ? d : (d.listings || []);
+    ST.stats = d.stats || {};
+    render();
+  }).catch(function(e){
+    flash('Feil: ' + e.message,'err');
+  }).finally(function(){
+    btn.disabled = false; btn.textContent = 'Skann nå';
+    setDot('live','Tilkoblet');
+  });
 }
 
 function loadS() {
@@ -587,114 +925,140 @@ function loadS() {
 
 function saveS() {
   var c = getCfg();
-  apiFetch('/config',{method:'POST',body:JSON.stringify(c)}).then(function(){ ST.cfg=c; flash('Lagret','ok'); }).catch(function(e){ flash('Feil: '+e.message,'err'); });
+  apiFetch('/config', { method:'POST', body: JSON.stringify(c) })
+    .then(function(res){ ST.cfg = res.config || c; flash('Lagret','ok'); })
+    .catch(function(e){ flash('Feil: ' + e.message,'err'); });
 }
 
 function render() {
   var ls = ST.listings.slice();
-  if (ST.filter==='buy')    ls = ls.filter(function(l){return l.analysis&&l.analysis.action==='buy';});
+  if (ST.filter==='buy') ls = ls.filter(function(l){return l.analysis&&l.analysis.action==='buy';});
   else if (ST.filter==='maybe') ls = ls.filter(function(l){return l.analysis&&l.analysis.action==='maybe';});
-  else if (ST.filter==='hs')  ls = ls.filter(function(l){return (l.analysis&&l.analysis.score||0)>=8;});
+  else if (ST.filter==='hs') ls = ls.filter(function(l){return (l.analysis&&l.analysis.score||0)>=8;});
   else if (ST.filter==='des') ls = ls.filter(function(l){return l.analysis&&l.analysis.designerMatch;});
   else if (ST.filter==='ver') ls = ls.filter(function(l){return l.analysis&&l.analysis.deepSearched;});
-  ls.sort(function(a,b){return ((b.analysis&&b.analysis.score)||0)-((a.analysis&&a.analysis.score)||0);});
+  else if (ST.filter==='conf') ls = ls.filter(function(l){return (l.analysis&&l.analysis.confidence||0)>=80;});
+
+  var sort = document.getElementById('sortSel') ? document.getElementById('sortSel').value : 'hybrid';
+  ls.sort(function(a,b){
+    var aa=a.analysis||{}, bb=b.analysis||{};
+    if (sort==='profit') return (bb.potentialProfit||0) - (aa.potentialProfit||0);
+    if (sort==='confidence') return (bb.confidence||0) - (aa.confidence||0);
+    if (sort==='priceAsc') return (a.price||99999999) - (b.price||99999999);
+    if (sort==='newest') return new Date(b.pubDate||0).getTime() - new Date(a.pubDate||0).getTime();
+    return ((bb.score||0)*1000 + (bb.confidence||0)) - ((aa.score||0)*1000 + (aa.confidence||0));
+  });
 
   var out = document.getElementById('listingsOut');
-  if (!ls.length) { out.innerHTML = '<div class="empty"><div class="empty-icon">🪑</div><div class="empty-title">Ingen funn</div><div class="empty-sub">Ingen annonser matcher filteret.</div></div>'; return; }
-  var g = document.createElement('div'); g.className = 'grid';
-  ls.forEach(function(l,i){ g.appendChild(mkCard(l,i)); });
-  out.innerHTML = ''; out.appendChild(g);
+  if (!ls.length) {
+    out.innerHTML = '<div class="empty"><div class="empty-icon">🪑</div><div class="empty-title">Ingen funn</div><div class="empty-sub">Ingen annonser matcher filteret.</div></div>';
+  } else {
+    var g = document.createElement('div');
+    g.className = 'grid';
+    ls.forEach(function(l,i){ g.appendChild(mkCard(l,i)); });
+    out.innerHTML = ''; out.appendChild(g);
+  }
 
   document.getElementById('stotal').textContent = ST.listings.length;
   document.getElementById('sbuy').textContent = ST.listings.filter(function(l){return l.analysis&&l.analysis.action==='buy';}).length;
-  document.getElementById('smaybe').textContent = ST.listings.filter(function(l){return l.analysis&&l.analysis.action==='maybe';}).length;
-  var ps = ST.listings.map(function(l){return l.analysis&&l.analysis.potentialProfit;}).filter(Boolean);
-  document.getElementById('sprofit').textContent = ps.length ? Math.max.apply(null,ps).toLocaleString('nb-NO') : '—';
+  document.getElementById('sdeep').textContent = ST.listings.filter(function(l){return l.analysis&&l.analysis.deepSearched;}).length;
+  document.getElementById('shighconf').textContent = ST.listings.filter(function(l){return (l.analysis&&l.analysis.confidence||0)>=80;}).length;
+  var profits = ST.listings.map(function(l){return l.analysis&&l.analysis.potentialProfit;}).filter(function(v){return v!=null;});
+  document.getElementById('sprofit').textContent = profits.length ? Math.max.apply(null,profits).toLocaleString('nb-NO') : '—';
 }
 
 function mkCard(l,idx) {
   var a = l.analysis || {};
-  var sc = a.score||0;
+  var sc = a.score || 0;
   var scls = sc>=9?'s9':sc>=7?'s7':sc>=5?'s5':'s0';
   var acls = a.action==='buy'?'abuy':a.action==='skip'?'askip':'amaybe';
-  var albl = {buy:'Kjøp',maybe:'Vurder',skip:'Skip'}[a.action]||'Vurder';
-  var resale = a.verifiedResalePrice||a.estimatedResalePrice;
+  var albl = {buy:'Kjøp',maybe:'Vurder',skip:'Skip'}[a.action] || 'Vurder';
+  var resale = a.verifiedResalePrice || a.estimatedResalePrice;
   var rcls = 'r'+(a.riskLevel==='low'?'low':a.riskLevel==='high'?'hi':'med');
   var rlbl = {low:'Lav risiko',medium:'Medium',high:'Høy risiko'}[a.riskLevel]||'';
   var dt = l.pubDate ? new Date(l.pubDate).toLocaleDateString('nb-NO',{day:'numeric',month:'short'}) : '';
-  var conf = a.confidence!=null?a.confidence:sc>=9&&a.designerMatch?62:sc>=7&&a.designerMatch?52:sc>=7?42:sc>=5?32:20;
+  var conf = a.confidence!=null?a.confidence:20;
   var cc = conf>=70?'hi':conf>=45?'md':'lo';
 
   var el = document.createElement('div');
   el.className = 'card';
-  el.style.animationDelay = (idx*0.04)+'s';
+  el.style.animationDelay = (idx*0.04) + 's';
   el.innerHTML =
     '<div class="cimg">' +
       (l.imageUrl ? '<img src="'+esc(l.imageUrl)+'" loading="lazy" onerror="this.parentNode.innerHTML=\'<div class=cimg-empty>🪑</div>\'">' : '<div class="cimg-empty">🪑</div>') +
       '<div class="cbadges"><div class="atag '+acls+'">'+albl+'</div><div class="score '+scls+'">'+sc+'</div></div>' +
     '</div>' +
     '<div class="cbody">' +
-      '<div class="ctop"><span class="ccat">'+esc(a.category||'')+'</span>'+(a.designerMatch?'<span class="cdes">'+esc(a.designerMatch)+'</span>':'')+'</div>' +
+      '<div class="ctop"><span class="ccat">'+esc(a.category||'')+'</span>' + (a.designerMatch?'<span class="cdes">'+esc(a.designerMatch)+'</span>':'') + '</div>' +
       '<div class="ctitle">'+esc(l.title||'')+'</div>' +
       (a.reason?'<div class="creason">'+esc(a.reason)+'</div>':'') +
       '<div class="conf-wrap">' +
-        '<div class="conf-top"><span class="conf-lbl">Confidence</span><div class="conf-right">'+(a.deepSearched?'<span class="verified">◉ Web-verifisert</span>':'')+'<span class="cpct '+cc+'">'+conf+'%</span></div></div>' +
+        '<div class="conf-top"><span class="conf-lbl">Confidence</span><div class="conf-right">' + (a.deepSearched?'<span class="verified">◉ Web-verifisert</span>':'') + '<span class="cpct '+cc+'">'+conf+'%</span></div></div>' +
         '<div class="ctrack"><div class="cfill '+cc+'" style="width:'+conf+'%"></div></div>' +
         (a.confidenceReason?'<div class="cnote">'+esc(a.confidenceReason)+'</div>':'') +
         (a.marketEvidence?'<div class="mevidence">'+esc(a.marketEvidence)+'</div>':'') +
       '</div>' +
+      (a.keywords&&a.keywords.length?'<div class="kw">'+a.keywords.map(function(k){return '<span>'+esc(k)+'</span>';}).join('')+'</div>':'') +
       '<div class="cprices">' +
         '<div class="pcol"><span class="plbl">Pris</span><span class="pval">'+(l.price?l.price.toLocaleString('nb-NO'):'?')+'</span></div>' +
         '<div class="pcol"><span class="plbl">'+(a.deepSearched?'Verifisert':'Videresalg')+'</span><span class="pval '+(resale?'':'na')+'">'+(resale?resale.toLocaleString('nb-NO'):'—')+'</span></div>' +
-        '<div class="pcol"><span class="plbl">Profitt</span><span class="pval profit">'+(a.potentialProfit?'+'+a.potentialProfit.toLocaleString('nb-NO'):'—')+'</span></div>' +
+        '<div class="pcol"><span class="plbl">Profitt</span><span class="pval profit">'+(a.potentialProfit!=null?('+'+a.potentialProfit.toLocaleString('nb-NO')):'—')+'</span></div>' +
       '</div>' +
     '</div>' +
-    '<div class="cfooter"><div style="display:flex;align-items:center;gap:.5rem"><span class="cdate">'+dt+'</span>'+(a.riskLevel?'<span class="rpill '+rcls+'">'+rlbl+'</span>':'')+'</div><a href="'+esc(l.link||'#')+'" target="_blank" rel="noopener" class="clink">Åpne →</a></div>';
+    '<div class="cfooter"><div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap"><span class="cdate">'+dt+'</span>'+(a.riskLevel?'<span class="rpill '+rcls+'">'+rlbl+'</span>':'')+(a.comparableCount?'<span class="rpill rlow">'+a.comparableCount+' comps</span>':'')+'</div><a href="'+esc(l.link||'#')+'" target="_blank" rel="noopener" class="clink">Åpne →</a></div>';
   return el;
 }
 
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 
 function applyCfg(c){
-  terms = c.searchTerms||DEF_TERMS.slice();
-  document.getElementById('minScore').value=c.minScore||7;
-  document.getElementById('maxPrice').value=c.maxPrice||'';
-  document.getElementById('deepThr').value=c.deepSearchThreshold||7;
-  document.getElementById('webhook').value=c.webhookUrl||'';
+  terms = c.searchTerms || DEF_TERMS.slice();
+  document.getElementById('minScore').value = c.minScore || 7;
+  document.getElementById('minConf').value = c.minConfidence || 65;
+  document.getElementById('maxPrice').value = c.maxPrice || '';
+  document.getElementById('deepThr').value = c.deepSearchThreshold || 7;
+  document.getElementById('maxAnalyze').value = c.maxAnalyzePerScan || 15;
+  document.getElementById('cooldown').value = c.cooldownHours || 72;
+  document.getElementById('webhook').value = c.webhookUrl || '';
   renderTerms();
 }
+
 function getCfg(){
-  return {searchTerms:terms,minScore:parseInt(document.getElementById('minScore').value)||7,maxPrice:parseInt(document.getElementById('maxPrice').value)||null,deepSearchThreshold:parseInt(document.getElementById('deepThr').value)||7,webhookUrl:document.getElementById('webhook').value.trim()};
+  return {
+    searchTerms: terms,
+    minScore: parseInt(document.getElementById('minScore').value,10) || 7,
+    minConfidence: parseInt(document.getElementById('minConf').value,10) || 65,
+    maxPrice: parseInt(document.getElementById('maxPrice').value,10) || null,
+    deepSearchThreshold: parseInt(document.getElementById('deepThr').value,10) || 7,
+    maxAnalyzePerScan: parseInt(document.getElementById('maxAnalyze').value,10) || 15,
+    cooldownHours: parseInt(document.getElementById('cooldown').value,10) || 72,
+    webhookUrl: document.getElementById('webhook').value.trim()
+  };
 }
+
 function renderTerms(){
   document.getElementById('termsList').innerHTML = terms.map(function(t,i){ return '<div class="ttag">'+esc(t)+'<span class="tremove" onclick="rmTerm('+i+')">×</span></div>'; }).join('');
 }
-function addTerm(){var v=document.getElementById('newTerm').value.trim();if(v&&!terms.includes(v)){terms.push(v);renderTerms();}document.getElementById('newTerm').value='';}
-function rmTerm(i){terms.splice(i,1);renderTerms();}
-
-function pg(name,el){
-  document.querySelectorAll('.pg').forEach(function(p){p.classList.remove('on');});
-  document.querySelectorAll('.ntab').forEach(function(t){t.classList.remove('on');});
-  document.getElementById('p-'+name).classList.add('on');
-  el.classList.add('on');
-  if(name==='settings') loadS();
-}
-function filt(f,el){ST.filter=f;document.querySelectorAll('.chip').forEach(function(c){c.classList.remove('on');});el.classList.add('on');render();}
-function setDot(s,l){var d=document.getElementById('dot');d.className='dot'+(s==='live'?' live':s==='busy'?' busy':'');document.getElementById('dotlbl').textContent=l;}
-function flash(m,t){var e=document.getElementById('alertBar');e.className='alertbar on alert-'+(t==='ok'?'ok':'err');e.textContent=m;setTimeout(function(){e.classList.remove('on');},5000);}
-
-function cpyBlk(btn){var t=btn.closest('.codeblk').innerText.replace(/^Kopier\n?/,'');navigator.clipboard.writeText(t).then(function(){btn.textContent='✓';btn.classList.add('ok');setTimeout(function(){btn.textContent='Kopier';btn.classList.remove('ok');},2000);});}
-function cpyWkr(btn){var t=document.getElementById('workerSrc').textContent.trim();navigator.clipboard.writeText(t).then(function(){btn.textContent='✓ Kopiert';btn.classList.add('ok');setTimeout(function(){btn.textContent='Kopier alt';btn.classList.remove('ok');},2500);});}
+function addTerm(){ var v=document.getElementById('newTerm').value.trim(); if(v&&!terms.includes(v)){terms.push(v);renderTerms();} document.getElementById('newTerm').value=''; }
+function rmTerm(i){ terms.splice(i,1); renderTerms(); }
+function pg(name,el){ document.querySelectorAll('.pg').forEach(function(p){p.classList.remove('on');}); document.querySelectorAll('.ntab').forEach(function(t){t.classList.remove('on');}); document.getElementById('p-'+name).classList.add('on'); el.classList.add('on'); if(name==='settings') loadS(); }
+function filt(f,el){ ST.filter=f; document.querySelectorAll('.chip').forEach(function(c){c.classList.remove('on');}); el.classList.add('on'); render(); }
+function setDot(s,l){ var d=document.getElementById('dot'); d.className='dot'+(s==='live'?' live':s==='busy'?' busy':''); document.getElementById('dotlbl').textContent=l; }
+function flash(m,t){ var e=document.getElementById('alertBar'); e.className='alertbar on alert-'+(t==='ok'?'ok':'err'); e.textContent=m; setTimeout(function(){e.classList.remove('on');},5000); }
+function cpyBlk(btn){ var t=btn.closest('.codeblk').innerText.replace(/^Kopier\n?/,''); navigator.clipboard.writeText(t).then(function(){btn.textContent='✓';btn.classList.add('ok');setTimeout(function(){btn.textContent='Kopier';btn.classList.remove('ok');},2000);}); }
+function cpyWkr(btn){ var t=document.getElementById('workerSrc').textContent.trim(); navigator.clipboard.writeText(t).then(function(){btn.textContent='✓ Kopiert';btn.classList.add('ok');setTimeout(function(){btn.textContent='Kopier alt';btn.classList.remove('ok');},2500);}); }
 
 function loadDemo(){
-  ST.listings=[
-    {id:'d1',title:'Hans J. Wegner Y-stol i teak — original',link:'#',price:800,imageUrl:null,pubDate:new Date().toISOString(),analysis:{score:9,reason:'Klassisk Wegner Y-stol (CH24) til ekstremt lav pris — selger kjenner trolig ikke verdien.',estimatedResalePrice:4500,verifiedResalePrice:4800,potentialProfit:4000,category:'Stol',designerMatch:'Hans J. Wegner',riskLevel:'low',action:'buy',confidence:91,confidenceReason:'5 tilsvarende Y-stoler solgt på Lauritz siste 3 mnd, snittpris 4 800 kr',marketEvidence:'Lauritz: 4–6k kr · eBay: $450–700',deepSearched:true}},
-    {id:'d2',title:'Arne Jacobsen Series 7 stol, sort',link:'#',price:400,imageUrl:null,pubDate:new Date().toISOString(),analysis:{score:8,reason:'Ikonisk Series 7 til svært lav pris. Originale selges for 1 500–3 000 kr.',estimatedResalePrice:2200,verifiedResalePrice:2100,potentialProfit:1700,category:'Stol',designerMatch:'Arne Jacobsen',riskLevel:'low',action:'buy',confidence:84,confidenceReason:'Mange Series 7 på markedet — bekreft original vs. repro.',marketEvidence:'Finn aktive: 1,5–3k · eBay: $80–200',deepSearched:true}},
-    {id:'d3',title:'Teak sofabord 60-talls dansk',link:'#',price:1200,imageUrl:null,pubDate:new Date().toISOString(),analysis:{score:7,reason:'Klassisk dansk teakbord fra 60-tallet. Kan selges for 2 500–3 500 kr.',estimatedResalePrice:3000,potentialProfit:1800,category:'Bord',designerMatch:null,riskLevel:'medium',action:'maybe',confidence:58,confidenceReason:'Varierende pris avhengig av merke og stand.',marketEvidence:'Finn solgte: 2–4k kr',deepSearched:true}},
-    {id:'d4',title:'Poul Kjærholm PK22 inspirert stol',link:'#',price:2500,imageUrl:null,pubDate:new Date().toISOString(),analysis:{score:6,reason:'Mulig repro eller original. Originaler selges for 15 000+ kr.',estimatedResalePrice:5000,potentialProfit:2500,category:'Stol',designerMatch:'Poul Kjærholm',riskLevel:'medium',action:'maybe',confidence:44,confidenceReason:'«Inspirert» tyder på repro — usikkert uten bilde.',marketEvidence:'Originaler: 15–40k · Repro: 2–4k',deepSearched:true}},
-    {id:'d5',title:'Vintage lenestol grønn stoff ukjent merke',link:'#',price:500,imageUrl:null,pubDate:new Date().toISOString(),analysis:{score:3,reason:'Ukjent produsent, vanskelig å prissette uten merke.',estimatedResalePrice:700,potentialProfit:200,category:'Lenestol',designerMatch:null,riskLevel:'high',action:'skip',confidence:21,confidenceReason:'Ingen merke gjør det svært vanskelig å estimere salgspris.',deepSearched:false}},
+  ST.stats = { lastScan: new Date().toISOString() };
+  ST.listings = [
+    {id:'d1',title:'Hans J. Wegner Y-stol i teak — original',link:'#',price:800,imageUrl:null,pubDate:new Date().toISOString(),analysis:{score:9,reason:'Klassisk Wegner Y-stol til ekstremt lav pris.',estimatedResalePrice:4500,verifiedResalePrice:4800,potentialProfit:4000,category:'Stol',designerMatch:'Hans J. Wegner',riskLevel:'low',action:'buy',confidence:91,confidenceReason:'Flere sammenlignbare salg med tydelig spenn rundt 4,8k.',marketEvidence:'Lauritz: 4–6k · eBay sold: $450–700',deepSearched:true,comparableCount:5,keywords:['wegner','teak','y-stol']}},
+    {id:'d2',title:'Arne Jacobsen Series 7 stol, sort',link:'#',price:400,imageUrl:null,pubDate:new Date().toISOString(),analysis:{score:8,reason:'Sterk merkevare og tydelig annenhåndsmarked.',estimatedResalePrice:2200,verifiedResalePrice:2100,potentialProfit:1700,category:'Stol',designerMatch:'Arne Jacobsen',riskLevel:'low',action:'buy',confidence:84,confidenceReason:'Markedet er likvid, men originalitet må bekreftes.',marketEvidence:'Finn aktive: 1,5–3k · eBay sold: $80–200',deepSearched:true,comparableCount:7,keywords:['series 7','jacobsen']}},
+    {id:'d3',title:'Teak sofabord 60-talls dansk',link:'#',price:1200,imageUrl:null,pubDate:new Date().toISOString(),analysis:{score:7,reason:'God stilretning, men modell ikke sikkert identifisert.',estimatedResalePrice:3000,verifiedResalePrice:2800,potentialProfit:1600,category:'Bord',designerMatch:null,riskLevel:'medium',action:'maybe',confidence:58,confidenceReason:'Prisnivået varierer mye med stand og produsent.',marketEvidence:'Finn solgte: ca. 2–4k',deepSearched:true,comparableCount:3,keywords:['teak','60-tall']}},
+    {id:'d4',title:'Poul Kjærholm PK22 inspirert stol',link:'#',price:2500,imageUrl:null,pubDate:new Date().toISOString(),analysis:{score:6,reason:'Trolig repro og dermed svakere margin.',estimatedResalePrice:3200,potentialProfit:700,category:'Stol',designerMatch:'Poul Kjærholm',riskLevel:'medium',action:'maybe',confidence:39,confidenceReason:'"Inspirert" trekker confidence tydelig ned.',marketEvidence:'Repro: 2–4k · originaler langt høyere',deepSearched:true,comparableCount:2,keywords:['pk22','repro']}},
+    {id:'d5',title:'Vintage lenestol grønn stoff ukjent merke',link:'#',price:500,imageUrl:null,pubDate:new Date().toISOString(),analysis:{score:3,reason:'For lite info til trygg marginvurdering.',estimatedResalePrice:700,potentialProfit:200,category:'Lenestol',designerMatch:null,riskLevel:'high',action:'skip',confidence:21,confidenceReason:'Ingen merke eller tydelig modell.',deepSearched:false,keywords:['ukjent']}}
   ];
   render();
+  document.getElementById('scanLbl').textContent = 'Demo-data lastet';
   flash('Demo-modus aktiv — koble til Worker for ekte data','ok');
 }
 </script>
